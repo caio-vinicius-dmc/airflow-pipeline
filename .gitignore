@@ -1,0 +1,16 @@
+__pycache__/
+*.py[cod]
+.venv/
+
+.env
+
+# Volumes e saída do Airflow montados em bind
+logs/
+plugins/
+config/
+*.pid
+*.cfg
+!airflow.cfg.example
+
+.vscode/
+.idea/

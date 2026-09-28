@@ -1,0 +1,163 @@
+# Ambiente local do Airflow 3 com LocalExecutor.
+#
+# É uma versão enxuta do compose oficial: sem Redis, sem Celery, sem worker
+# separado. O LocalExecutor roda as tarefas em processos do próprio
+# scheduler, o que basta para um DAG e deixa o ambiente subir em menos de
+# metade do tempo.
+#
+# Nada aqui serve para produção -- os apontamentos estão no README.
+
+x-airflow-comum: &airflow-comum
+  image: apache/airflow:3.1.3
+  environment: &airflow-ambiente
+    AIRFLOW__CORE__EXECUTOR: LocalExecutor
+    AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+    AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: "false"
+    AIRFLOW__CORE__DEFAULT_TIMEZONE: America/Sao_Paulo
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: >-
+      postgresql+psycopg2://${POSTGRES_USER:-airflow}:${POSTGRES_PASSWORD:-airflow_local}@postgres/airflow
+    # O api-server pública a Execution API; scheduler e tarefas falam com ela.
+    AIRFLOW__CORE__EXECUTION_API_SERVER_URL: http://airflow-apiserver:8080/execution/
+    AIRFLOW__API_AUTH__JWT_SECRET: ${AIRFLOW_JWT_SECRET:-segredo_local_trocar}
+    # Fixa, e não gerada a cada subida: caso contrário as senhas das
+    # Connections gravadas na execução anterior não podem mais ser lidas.
+    AIRFLOW__CORE__FERNET_KEY: ${AIRFLOW_FERNET_KEY:-}
+    # Autenticação simples e sem senha, válida SÓ em ambiente local.
+    # Em qualquer ambiente compartilhado, troque por um auth manager real.
+    AIRFLOW__CORE__SIMPLE_AUTH_MANAGER_ALL_ADMINS: "true"
+    AIRFLOW__LOGGING__LOGGING_LEVEL: INFO
+    # O Airflow 3 não adiciona mais a pasta de DAGs ao sys.path sozinho.
+    # Sem isto, "from clima import api" funciona no dag-processor mas falha
+    # na CLI, e o erro só aparece na hora de rodar um teste.
+    PYTHONPATH: /opt/airflow/dags
+    # Lida pelo módulo dags/clima/api.py.
+    API_CLIMA_URL: http://api-clima:8000
+    PYTHONWARNINGS: ignore::DeprecationWarning
+  volumes:
+    - ./dags:/opt/airflow/dags
+    - ./logs:/opt/airflow/logs
+  user: "${AIRFLOW_UID:-50000}:0"
+  depends_on:
+    postgres:
+      condition: service_healthy
+
+services:
+  postgres:
+    image: postgres:17-alpine
+    container_name: airflow_pipeline_db
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-airflow}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-airflow_local}
+      POSTGRES_DB: airflow
+    ports:
+      - "${POSTGRES_PORT:-15435}:5432"
+    volumes:
+      - dados_postgres:/var/lib/postgresql/data
+      # Scripts de inicialização rodam uma vez, na criação do volume.
+      - ./sql:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-airflow} -d airflow"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  api-clima:
+    image: python:3.12-alpine
+    container_name: airflow_pipeline_api
+    command: ["python", "-u", "/app/api.py"]
+    environment:
+      PORTA: "8000"
+    volumes:
+      - ./servico-api:/app:ro
+    ports:
+      - "${API_CLIMA_PORT:-18000}:8000"
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8000/saude')\""]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  airflow-init:
+    <<: *airflow-comum
+    container_name: airflow_pipeline_init
+    entrypoint: /bin/bash
+    # A senha da conexão vem do ambiente, nunca escrita no arquivo.
+    command:
+      - -c
+      - |
+        set -e
+        airflow db migrate
+        airflow connections delete postgres_analytics 2>/dev/null || true
+        airflow connections add postgres_analytics \
+          --conn-type postgres \
+          --conn-host postgres \
+          --conn-port 5432 \
+          --conn-schema analytics \
+          --conn-login "$${POSTGRES_USER:-airflow}" \
+          --conn-password "$${POSTGRES_PASSWORD:-airflow_local}"
+        echo "Ambiente pronto."
+    environment:
+      <<: *airflow-ambiente
+      POSTGRES_USER: ${POSTGRES_USER:-airflow}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-airflow_local}
+    restart: "no"
+
+  airflow-apiserver:
+    <<: *airflow-comum
+    container_name: airflow_pipeline_apiserver
+    command: api-server
+    ports:
+      - "${AIRFLOW_PORT:-18080}:8080"
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8080/api/v2/version"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      start_period: 40s
+    depends_on:
+      postgres:
+        condition: service_healthy
+      airflow-init:
+        condition: service_completed_successfully
+
+  airflow-scheduler:
+    <<: *airflow-comum
+    container_name: airflow_pipeline_scheduler
+    command: scheduler
+    depends_on:
+      postgres:
+        condition: service_healthy
+      airflow-init:
+        condition: service_completed_successfully
+      airflow-apiserver:
+        condition: service_healthy
+
+  # No Airflow 3 a leitura dos arquivos de DAG roda em processo próprio,
+  # isolado do scheduler. Um erro de import num DAG não derruba mais o
+  # agendamento dos outros.
+  airflow-dag-processor:
+    <<: *airflow-comum
+    container_name: airflow_pipeline_dagprocessor
+    command: dag-processor
+    depends_on:
+      postgres:
+        condition: service_healthy
+      airflow-init:
+        condition: service_completed_successfully
+
+  # Não é usado por este DAG, que não tem operador deferrable. Esta aqui
+  # porque sem ele o painel de saude do Airflow mostra o componente em
+  # vermelho, e o primeiro reflexo de quem abre a interface e achar que o
+  # ambiente subiu quebrado.
+  airflow-triggerer:
+    <<: *airflow-comum
+    container_name: airflow_pipeline_triggerer
+    command: triggerer
+    depends_on:
+      postgres:
+        condition: service_healthy
+      airflow-init:
+        condition: service_completed_successfully
+
+volumes:
+  dados_postgres:
